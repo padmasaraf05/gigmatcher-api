@@ -15,10 +15,15 @@
 import os
 import math
 import logging
+import time
 from typing import Optional
+from collections import defaultdict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security.api_key import APIKeyHeader
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 from pydantic import BaseModel
 from supabase import create_client, Client
 
@@ -35,13 +40,71 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# ── Allowed origins ───────────────────────────────────────────────────────────
+# Add your Lovable / Vercel / custom domain here.
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
+    "ALLOWED_ORIGINS",
+    "http://localhost:8080,http://localhost:3000,https://gigmatcher.lovable.app"
+).split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Restrict to your domain in production
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
+
+# ── Rate limiting middleware ───────────────────────────────────────────────────
+# Simple in-process rate limiter: 60 requests/minute per IP.
+# Replace with Redis-backed limiter for multi-instance deployments.
+
+_rate_store: dict[str, list[float]] = defaultdict(list)
+RATE_LIMIT   = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "60"))
+RATE_WINDOW  = 60  # seconds
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Skip health check from rate limiting
+        if request.url.path == "/health":
+            return await call_next(request)
+
+        client_ip = request.client.host if request.client else "unknown"
+        now       = time.time()
+        window_start = now - RATE_WINDOW
+
+        # Clean old entries and check count
+        calls = _rate_store[client_ip]
+        calls[:] = [t for t in calls if t > window_start]
+
+        if len(calls) >= RATE_LIMIT:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": f"Rate limit exceeded. Max {RATE_LIMIT} requests/minute."},
+                headers={"Retry-After": "60"},
+            )
+
+        calls.append(now)
+        return await call_next(request)
+
+app.add_middleware(RateLimitMiddleware)
+
+# ── API Key authentication ─────────────────────────────────────────────────────
+# Set GIGMATCHER_API_KEY env var on Render.
+# Frontend must send header: X-API-Key: <key>
+# Set VITE_API_KEY=<same-key> in frontend .env
+# If GIGMATCHER_API_KEY is not set, auth is DISABLED (dev mode).
+
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+def verify_api_key(api_key: Optional[str] = Security(api_key_header)) -> bool:
+    required_key = os.environ.get("GIGMATCHER_API_KEY")
+    if not required_key:
+        return True   # Dev mode: no key required
+    if not api_key or api_key != required_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return True
 
 # ── Supabase client (service role — bypasses RLS for server-side queries) ─────
 
@@ -149,7 +212,7 @@ class DemandResponse(BaseModel):
     computed_at: str
 
 @app.post("/predict-demand", response_model=DemandResponse)
-async def predict_demand():
+async def predict_demand(_auth: bool = Security(verify_api_key)):
     logger.info("Starting demand prediction computation")
     supabase = get_supabase()
 
@@ -253,6 +316,7 @@ async def predict_demand():
 
 @app.get("/demand-summary")
 async def demand_summary(
+    _auth: bool = Security(verify_api_key),
     worker_lat: Optional[float] = None,
     worker_lng: Optional[float] = None,
 ):
@@ -312,7 +376,8 @@ async def demand_summary(
 # ── /match ────────────────────────────────────────────────────────────────────
 
 @app.post("/match", response_model=MatchResponse)
-async def match_workers(req: MatchRequest):
+async def match_workers(
+    _auth: bool = Security(verify_api_key),req: MatchRequest):
     logger.info(f"Match request: category={req.category_slug} sort={req.sort} "
                 f"lat={req.customer_lat} lng={req.customer_lng}")
 
