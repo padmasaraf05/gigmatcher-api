@@ -121,6 +121,194 @@ class MatchResponse(BaseModel):
 async def health():
     return {"status": "ok", "service": "gigmatcher-api"}
 
+# ── /predict-demand ───────────────────────────────────────────────────────────
+# Recalculates demand predictions from real job history and writes results
+# to the demand_predictions table. Called:
+#   - On a schedule (Render cron or external ping every hour)
+#   - Manually via /docs for testing
+#
+# Algorithm:
+#   1. Fetch all jobs from last 30 days with lat/lng + category
+#   2. Bucket by 0.05° grid (~5km squares)
+#   3. Score = (7d count × 3) + (30d count × 1), normalised 0-100
+#   4. Clear stale predictions, insert fresh ones
+#   5. Returns top 5 predictions for verification
+
+class DemandPrediction(BaseModel):
+    category_name:          str
+    area_name:              str
+    area_lat:               float
+    area_lng:               float
+    predicted_demand_score: float
+    job_count_7d:           int
+    job_count_30d:          int
+
+class DemandResponse(BaseModel):
+    predictions: list[DemandPrediction]
+    total:       int
+    computed_at: str
+
+@app.post("/predict-demand", response_model=DemandResponse)
+async def predict_demand():
+    logger.info("Starting demand prediction computation")
+    supabase = get_supabase()
+
+    from datetime import datetime, timezone, timedelta
+
+    now    = datetime.now(timezone.utc)
+    ago_7d  = (now - timedelta(days=7)).isoformat()
+    ago_30d = (now - timedelta(days=30)).isoformat()
+
+    # ── 1. Fetch jobs with location from last 30 days ─────────────────────────
+    jobs_res = (supabase.table("jobs")
+                .select("category_id, latitude, longitude, created_at, status")
+                .gte("created_at", ago_30d)
+                .not_("latitude",  "is", "null")
+                .not_("longitude", "is", "null")
+                .execute())
+
+    jobs = jobs_res.data or []
+    logger.info(f"Fetched {len(jobs)} jobs with location from last 30 days")
+
+    if not jobs:
+        # No real data — call DB function to keep seeded data fresh
+        supabase.rpc("compute_demand_predictions").execute()
+        return DemandResponse(predictions=[], total=0, computed_at=now.isoformat())
+
+    # ── 2. Fetch category names ───────────────────────────────────────────────
+    cat_res = supabase.table("service_categories").select("id, name").execute()
+    cat_map = {c["id"]: c["name"] for c in (cat_res.data or [])}
+
+    # ── 3. Bucket jobs by category + 0.05° grid ───────────────────────────────
+    BUCKET_SIZE = 0.05  # ~5km
+    from collections import defaultdict
+
+    buckets: dict[tuple, dict] = defaultdict(lambda: {"count_7d": 0, "count_30d": 0})
+
+    for j in jobs:
+        cat_id = j.get("category_id")
+        lat    = j.get("latitude")
+        lng    = j.get("longitude")
+        if not cat_id or lat is None or lng is None:
+            continue
+
+        bucket_lat = round(round(float(lat) / BUCKET_SIZE) * BUCKET_SIZE, 4)
+        bucket_lng = round(round(float(lng) / BUCKET_SIZE) * BUCKET_SIZE, 4)
+        key = (cat_id, bucket_lat, bucket_lng)
+
+        buckets[key]["count_30d"] += 1
+        if j.get("created_at", "") >= ago_7d:
+            buckets[key]["count_7d"] += 1
+
+    logger.info(f"Found {len(buckets)} demand buckets")
+
+    # ── 4. Score and build prediction rows ────────────────────────────────────
+    predictions_to_insert = []
+    prediction_results    = []
+
+    for (cat_id, blat, blng), counts in buckets.items():
+        score = min(100.0, (counts["count_7d"] * 3 + counts["count_30d"] * 1) * 10)
+        cat_name = cat_map.get(cat_id, "Service")
+        area_name = f"{cat_name} — {blat:.2f}°N {blng:.2f}°E"
+
+        predictions_to_insert.append({
+            "category_id":            cat_id,
+            "area_name":              area_name,
+            "area_lat":               blat,
+            "area_lng":               blng,
+            "predicted_demand_score": score,
+            "job_count_7d":           counts["count_7d"],
+            "job_count_30d":          counts["count_30d"],
+            "computed_at":            now.isoformat(),
+        })
+        prediction_results.append(DemandPrediction(
+            category_name=cat_name, area_name=area_name,
+            area_lat=blat, area_lng=blng,
+            predicted_demand_score=score,
+            job_count_7d=counts["count_7d"],
+            job_count_30d=counts["count_30d"],
+        ))
+
+    # ── 5. Clear stale, insert fresh ─────────────────────────────────────────
+    # Only clear rows computed by FastAPI (keep seeded rows if no real data)
+    stale_cutoff = (now - timedelta(hours=2)).isoformat()
+    supabase.table("demand_predictions").delete().lt("computed_at", stale_cutoff).execute()
+
+    if predictions_to_insert:
+        supabase.table("demand_predictions").insert(predictions_to_insert).execute()
+        logger.info(f"Inserted {len(predictions_to_insert)} demand predictions")
+
+    # Sort by score descending for response
+    prediction_results.sort(key=lambda p: p.predicted_demand_score, reverse=True)
+
+    return DemandResponse(
+        predictions=prediction_results[:10],
+        total=len(prediction_results),
+        computed_at=now.isoformat(),
+    )
+
+# ── /demand-summary ───────────────────────────────────────────────────────────
+# Lightweight read used by worker dashboard to get top demand alert.
+# Returns the single highest-scoring prediction for a given worker location.
+
+@app.get("/demand-summary")
+async def demand_summary(
+    worker_lat: Optional[float] = None,
+    worker_lng: Optional[float] = None,
+):
+    supabase = get_supabase()
+
+    res = (supabase.table("demand_predictions")
+           .select("area_name, predicted_demand_score, area_lat, area_lng, "
+                   "job_count_7d, category_id")
+           .order("predicted_demand_score", desc=True)
+           .limit(10)
+           .execute())
+
+    predictions = res.data or []
+    if not predictions:
+        return {"alert": "", "top_predictions": []}
+
+    # If worker location given, find closest high-demand area
+    best = predictions[0]
+    if worker_lat is not None and worker_lng is not None:
+        for p in predictions:
+            if p.get("area_lat") and p.get("area_lng"):
+                dist = haversine_km(worker_lat, worker_lng,
+                                    float(p["area_lat"]), float(p["area_lng"]))
+                if dist <= 10:   # within 10km
+                    best = p
+                    break
+
+    # Fetch category name
+    cat_name = ""
+    if best.get("category_id"):
+        cat_res = (supabase.table("service_categories")
+                   .select("name")
+                   .eq("id", best["category_id"])
+                   .single()
+                   .execute())
+        cat_name = cat_res.data.get("name", "") if cat_res.data else ""
+
+    score    = best.get("predicted_demand_score", 0)
+    area     = best.get("area_name", "your area")
+    jobs_7d  = best.get("job_count_7d", 0)
+
+    if score >= 80:
+        level = "🔥 Very high"
+    elif score >= 50:
+        level = "📈 High"
+    else:
+        level = "📊 Moderate"
+
+    alert = (f"{level} demand for {cat_name} in {area}!"
+             if cat_name else
+             f"{level} demand in {area}!")
+    if jobs_7d > 0:
+        alert += f" ({jobs_7d} jobs this week)"
+
+    return {"alert": alert, "top_predictions": predictions[:5]}
+
 # ── /match ────────────────────────────────────────────────────────────────────
 
 @app.post("/match", response_model=MatchResponse)
@@ -153,6 +341,7 @@ async def match_workers(req: MatchRequest):
         raise HTTPException(status_code=404, detail=f"Category '{category_label}' not found in DB")
 
     category_id = cat_res.data["id"]
+    logger.info(f"Step 1: category_id={category_id} for label={category_label}")
 
     # ── 2. Get worker IDs with this skill ─────────────────────────────────────
     skill_res = (supabase.table("worker_skills")
@@ -160,23 +349,30 @@ async def match_workers(req: MatchRequest):
                  .eq("category_id", category_id)
                  .execute())
 
+    logger.info(f"Step 2: worker_skills returned {len(skill_res.data or [])} rows")
+
     if not skill_res.data:
         return MatchResponse(workers=[], total=0)
 
     worker_ids = [r["worker_id"] for r in skill_res.data]
 
-    # ── 3. Fetch worker profiles (available only) ─────────────────────────────
+    # ── 3. Fetch worker profiles — filter available in Python (supabase-py bool bug) ─
     wp_res = (supabase.table("worker_profiles")
               .select("user_id, is_available, is_pro, rating, total_reviews, "
                       "hourly_rate, availability_days, latitude, longitude, service_radius_km")
               .in_("user_id", worker_ids)
-              .eq("is_available", True)
               .execute())
 
-    if not wp_res.data:
+    logger.info(f"Step 3: worker_profiles returned {len(wp_res.data or [])} rows (before availability filter)")
+
+    # Filter available workers in Python — avoids supabase-py boolean comparison issues
+    available_profiles = [wp for wp in (wp_res.data or []) if wp.get("is_available") is True]
+    logger.info(f"Step 3: {len(available_profiles)} workers are available")
+
+    if not available_profiles:
         return MatchResponse(workers=[], total=0)
 
-    available_worker_ids = [wp["user_id"] for wp in wp_res.data]
+    available_worker_ids = [wp["user_id"] for wp in available_profiles]
 
     # ── 4. Fetch profiles, tools, skills in parallel ──────────────────────────
     profiles_res = (supabase.table("profiles")
@@ -218,7 +414,7 @@ async def match_workers(req: MatchRequest):
     # ── 6. Build worker results ───────────────────────────────────────────────
     results: list[WorkerResult] = []
 
-    for wp in wp_res.data:
+    for wp in available_profiles:
         wid = wp["user_id"]
 
         # Distance calculation
